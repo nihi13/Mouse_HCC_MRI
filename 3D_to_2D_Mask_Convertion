@@ -1,0 +1,650 @@
+# Mouse_HCC_MRI
+Working with HCC Mouse Models-- T1 and T2 MRI images
+
+## To convert 3D.dcm formatted images into multiple 2D .dcm formatted images to ease redability use this convertion (if ITK-SNAP OR 3D SLICER does not work)##
+
+import pydicom
+import numpy as np
+from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SpatialDICOMAligner:
+    def __init__(self, mri_folder, mask_file, output_folder, 
+                 position_tolerance=0.5, debug_mode=True):
+        """
+        Spatially-aware DICOM aligner using patient ID + weeks matching
+        Converts unmatched slices to black masks automatically
+        
+        Args:
+            mri_folder: Path to 2D MRI DICOM slices
+            mask_file: Path to 3D mask DICOM file
+            output_folder: Path to save aligned 2D mask slices
+            position_tolerance: Max distance (mm) for position matching
+            debug_mode: Enable detailed logging
+        """
+        self.mri_folder = Path(mri_folder)
+        self.mask_file = Path(mask_file)
+        self.output_folder = Path(output_folder)
+        self.position_tolerance = position_tolerance
+        self.debug_mode = debug_mode
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        
+    def get_slice_position(self, dataset):
+        """Extract Z-coordinate from DICOM spatial metadata"""
+        if hasattr(dataset, 'ImagePositionPatient'):
+            return float(dataset.ImagePositionPatient[2])
+        elif hasattr(dataset, 'SliceLocation'):
+            return float(dataset.SliceLocation)
+        return None
+    
+    def extract_patient_prefix(self, filename):
+        """Extract patient ID + weeks from filename """
+        # Returns: NAME-###_##w
+        name_without_ext = filename.replace('.dcm', '')
+        parts = name_without_ext.split('-ax_slice')
+        if parts:
+            return parts[0]  
+    
+    def load_mri_slices(self, patient_prefix):
+        """Load and sort MRI slices by spatial position for specific patient+weeks combo"""
+        mri_slices = []
+        
+        # Find all files matching this patient prefix (Name-###_##w)
+        dicom_files = [f for f in self.mri_folder.glob(f"{patient_prefix}-ax_slice*.dcm")]
+        
+        logger.info(f"Found {len(dicom_files)} MRI files for {patient_prefix}")
+        
+        for file_path in dicom_files:
+            try:
+                ds = pydicom.dcmread(str(file_path), force=True)
+                position = self.get_slice_position(ds)
+                
+                if position is None:
+                    logger.warning(f"No position info for {file_path.name}, skipping")
+                    continue
+                
+                mri_slices.append({
+                    'dataset': ds,
+                    'file_path': file_path,
+                    'position': position,
+                    'filename': file_path.name
+                })
+                
+            except Exception as e:
+                logger.warning(f"Could not read {file_path.name}: {e}")
+        
+        # Sort by Z position
+        mri_slices.sort(key=lambda x: x['position'])
+        
+        logger.info(f"Loaded {len(mri_slices)} valid MRI slices for {patient_prefix}")
+        if mri_slices:
+            logger.info(f"MRI Z-range: {mri_slices[0]['position']:.2f} to {mri_slices[-1]['position']:.2f}")
+        
+        return mri_slices
+    
+    def load_3d_mask(self):
+        """Load 3D mask DICOM and extract slice positions - WITH DEBUGGING"""
+        try:
+            mask_ds = pydicom.dcmread(str(self.mask_file), force=True)
+            mask_array = mask_ds.pixel_array
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"MASK LOADING DEBUG INFO")
+            logger.info(f"{'='*60}")
+            logger.info(f"Loaded 3D mask from: {self.mask_file.name}")
+            logger.info(f"  Shape: {mask_array.shape}")
+            logger.info(f"  Dtype: {mask_array.dtype}")
+            logger.info(f"  Min value: {mask_array.min()}")
+            logger.info(f"  Max value: {mask_array.max()}")
+            logger.info(f"  Unique values: {np.unique(mask_array)}")
+            logger.info(f"  Non-zero pixels: {np.count_nonzero(mask_array)}/{mask_array.size}")
+            
+            # CRITICAL CHECK: If mask is all zeros, something is wrong!
+            if np.count_nonzero(mask_array) == 0:
+                logger.error("WARNING: Mask contains ONLY ZEROS! Check your mask file!")
+            
+            mask_slices = []
+            
+            # Enhanced multi-frame DICOM with per-frame positions
+            if hasattr(mask_ds, 'PerFrameFunctionalGroupsSequence'):
+                logger.info("Processing enhanced multi-frame DICOM")
+                
+                for i, frame in enumerate(mask_ds.PerFrameFunctionalGroupsSequence):
+                    position = None
+                    
+                    if hasattr(frame, 'PlanePositionSequence') and len(frame.PlanePositionSequence) > 0:
+                        pos = frame.PlanePositionSequence[0].ImagePositionPatient
+                        position = float(pos[2])
+                    
+                    if position is not None:
+                        slice_data = mask_array[i] if len(mask_array.shape) == 3 else mask_array
+                        logger.info(f"  Frame {i}: Z={position:.2f}, "
+                                  f"non-zero={np.count_nonzero(slice_data)}, "
+                                  f"values={np.unique(slice_data)}")
+                        mask_slices.append({
+                            'index': i,
+                            'position': position,
+                            'data': slice_data
+                        })
+            
+            # 3D array - need to calculate positions from spacing
+            elif len(mask_array.shape) == 3:
+                logger.info("Processing 3D mask array")
+                
+                start_pos = None
+                if hasattr(mask_ds, 'ImagePositionPatient'):
+                    start_pos = float(mask_ds.ImagePositionPatient[2])
+                elif hasattr(mask_ds, 'SliceLocation'):
+                    start_pos = float(mask_ds.SliceLocation)
+                
+                spacing = None
+                if hasattr(mask_ds, 'SpacingBetweenSlices'):
+                    spacing = float(mask_ds.SpacingBetweenSlices)
+                elif hasattr(mask_ds, 'SliceThickness'):
+                    spacing = float(mask_ds.SliceThickness)
+                
+                if start_pos is None or spacing is None:
+                    raise ValueError(
+                        f"Cannot determine slice positions. "
+                        f"Start position: {start_pos}, Spacing: {spacing}"
+                    )
+                
+                logger.info(f"  Start Z: {start_pos:.2f}, Spacing: {spacing:.2f}")
+                
+                for i in range(mask_array.shape[0]):
+                    position = start_pos + i * spacing
+                    slice_data = mask_array[i]
+                    
+                    # Debug info for each slice
+                    if i % 10 == 0 or np.count_nonzero(slice_data) > 0:
+                        logger.info(f"  Slice {i}: Z={position:.2f}, "
+                                  f"non-zero={np.count_nonzero(slice_data)}, "
+                                  f"shape={slice_data.shape}")
+                    
+                    mask_slices.append({
+                        'index': i,
+                        'position': position,
+                        'data': slice_data
+                    })
+            
+            # 2D single slice
+            elif len(mask_array.shape) == 2:
+                logger.info("Processing 2D mask (single slice)")
+                position = self.get_slice_position(mask_ds)
+                if position is None:
+                    position = 0.0
+                    logger.warning("No position info, using Z=0")
+                
+                logger.info(f"  Single slice: Z={position:.2f}, "
+                          f"non-zero={np.count_nonzero(mask_array)}, "
+                          f"values={np.unique(mask_array)}")
+                
+                mask_slices.append({
+                    'index': 0,
+                    'position': position,
+                    'data': mask_array
+                })
+            
+            else:
+                raise ValueError(f"Unexpected mask shape: {mask_array.shape}")
+            
+            mask_slices.sort(key=lambda x: x['position'])
+            
+            logger.info(f"\n✓ Extracted {len(mask_slices)} mask slices")
+            if mask_slices:
+                logger.info(f"✓ Mask Z-range: {mask_slices[0]['position']:.2f} to {mask_slices[-1]['position']:.2f}")
+            logger.info(f"{'='*60}\n")
+            
+            return mask_ds, mask_slices
+            
+        except Exception as e:
+            logger.error(f"Failed to load mask: {e}")
+            raise
+    
+    def find_matching_mask(self, mri_position, mask_slices):
+        """Find mask slice that matches MRI position"""
+        best_match = None
+        best_distance = float('inf')
+        
+        for mask_slice in mask_slices:
+            distance = abs(mri_position - mask_slice['position'])
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_match = mask_slice
+        
+        if best_distance <= self.position_tolerance:
+            if self.debug_mode:
+                non_zero = np.count_nonzero(best_match['data'])
+                logger.debug(
+                    f"✓ Matched MRI Z={mri_position:.2f} to mask Z={best_match['position']:.2f} "
+                    f"(distance: {best_distance:.3f}mm, non-zero pixels: {non_zero})"
+                )
+            return best_match
+        else:
+            if self.debug_mode:
+                logger.debug(
+                    f"✗ No match for MRI Z={mri_position:.2f} "
+                    f"(closest: {best_match['position']:.2f}, distance: {best_distance:.3f}mm) "
+                    f"→ Creating BLACK mask"
+                )
+            return None
+    
+    def create_mask_dicom(self, mri_ds, mask_ds, mask_data):
+        """Create 2D mask DICOM matching MRI spatial properties - WITH VALUE PRESERVATION"""
+        mask_slice_ds = pydicom.Dataset()
+        mask_slice_ds.file_meta = pydicom.Dataset()
+        
+        mask_slice_ds.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+        mask_slice_ds.file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.2'
+        mask_slice_ds.file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+        mask_slice_ds.file_meta.ImplementationClassUID = pydicom.uid.PYDICOM_IMPLEMENTATION_UID
+        
+        mask_slice_ds.is_implicit_VR = True
+        mask_slice_ds.is_little_endian = True
+        
+        for tag in ['StudyInstanceUID', 'SeriesInstanceUID', 'PatientID', 
+                   'PatientName', 'StudyDate', 'Modality']:
+            if hasattr(mask_ds, tag):
+                setattr(mask_slice_ds, tag, getattr(mask_ds, tag))
+        
+        for tag in ['ImagePositionPatient', 'ImageOrientationPatient', 
+                   'PixelSpacing', 'SliceThickness', 'SliceLocation']:
+            if hasattr(mri_ds, tag):
+                setattr(mask_slice_ds, tag, getattr(mri_ds, tag))
+        
+        mri_shape = mri_ds.pixel_array.shape
+        
+        # CRITICAL: Ensure mask data is properly formatted
+        mask_data = np.array(mask_data, dtype=np.float32)
+        
+        if mask_data.shape != mri_shape:
+            logger.warning(f"Mask shape {mask_data.shape} != MRI shape {mri_shape}, resizing...")
+            from scipy.ndimage import zoom
+            zoom_factors = [mri_shape[0] / mask_data.shape[0], 
+                          mri_shape[1] / mask_data.shape[1]]
+            mask_data = zoom(mask_data, zoom_factors, order=0)
+        
+        # CRITICAL: Ensure mask values are preserved (binarize if needed)
+        if mask_data.max() > 0:
+            # If mask has values, ensure they're visible (binary: 0 or 255)
+            mask_data = (mask_data > 0).astype(np.uint16) * 255
+        else:
+            mask_data = mask_data.astype(np.uint16)
+        
+        # Debug output
+        logger.debug(f"  Final mask: min={mask_data.min()}, max={mask_data.max()}, "
+                    f"non-zero={np.count_nonzero(mask_data)}")
+        
+        mask_slice_ds.PixelData = mask_data.tobytes()
+        mask_slice_ds.Rows, mask_slice_ds.Columns = mask_data.shape
+        mask_slice_ds.SamplesPerPixel = 1
+        mask_slice_ds.PhotometricInterpretation = 'MONOCHROME2'
+        mask_slice_ds.BitsAllocated = 16
+        mask_slice_ds.BitsStored = 16
+        mask_slice_ds.HighBit = 15
+        mask_slice_ds.PixelRepresentation = 0
+        
+        mask_slice_ds.SOPInstanceUID = mask_slice_ds.file_meta.MediaStorageSOPInstanceUID
+        mask_slice_ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.2'
+        
+        return mask_slice_ds
+    
+    def create_black_mask_dicom(self, mri_ds, mask_ds):
+        """Create completely BLACK mask DICOM (all zeros) when no matching mask slice found"""
+        mri_shape = mri_ds.pixel_array.shape
+        black_mask = np.zeros(mri_shape, dtype=np.uint16)
+        return self.create_mask_dicom(mri_ds, mask_ds, black_mask)
+    
+    def align_and_save(self):
+        """Main alignment function - converts unmatched slices to BLACK masks"""
+        # Extract patient prefix from mask filename 
+        patient_prefix = self.mask_file.stem  # Gets filename without extension
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing: {patient_prefix}")
+        logger.info(f"Mask file: {self.mask_file.name}")
+        logger.info(f"{'='*60}")
+        
+        # Load MRI slices matching this patient prefix
+        mri_slices = self.load_mri_slices(patient_prefix)
+        if not mri_slices:
+            logger.error(f"No MRI slices found for {patient_prefix}")
+            return
+        
+        # Load 3D mask
+        try:
+            mask_ds, mask_slices = self.load_3d_mask()
+        except Exception as e:
+            logger.error(f"Failed to load mask: {e}")
+            return
+        
+        if not mask_slices:
+            logger.error(f"No mask slices extracted")
+            return
+        
+        # Create output subfolder
+        output_folder = self.output_folder / patient_prefix
+        output_folder.mkdir(parents=True, exist_ok=True)
+        
+        matched = 0
+        black_masks = 0
+        failed = 0
+        total_non_zero = 0
+        
+        for i, mri_slice in enumerate(mri_slices):
+            mri_position = mri_slice['position']
+            matching_mask = self.find_matching_mask(mri_position, mask_slices)
+            
+            if matching_mask is not None:
+                mask_slice_ds = self.create_mask_dicom(
+                    mri_slice['dataset'], 
+                    mask_ds, 
+                    matching_mask['data']
+                )
+                if np.count_nonzero(matching_mask['data']) > 0:
+                    total_non_zero += 1
+                matched += 1
+            else:
+                # Create completely BLACK mask for unmatched slices
+                mask_slice_ds = self.create_black_mask_dicom(
+                    mri_slice['dataset'], 
+                    mask_ds
+                )
+                black_masks += 1
+            
+            output_filename = mri_slice['filename']
+            output_path = output_folder / output_filename
+            
+            try:
+                pydicom.dcmwrite(str(output_path), mask_slice_ds)
+                if self.debug_mode and i % 10 == 0:
+                    logger.debug(f"Saved: {output_filename}")
+            except Exception as e:
+                logger.error(f"Failed to save {output_filename}: {e}")
+                failed += 1
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ALIGNMENT COMPLETE!")
+        logger.info(f"{'='*60}")
+        logger.info(f"  Total slices processed: {len(mri_slices)}")
+        logger.info(f"  ✓ Matched with mask data: {matched}")
+        logger.info(f"  ✓ Masks with actual data: {total_non_zero}")
+        logger.info(f"  ■ Created BLACK masks: {black_masks}")
+        logger.info(f"  ✗ Failed: {failed}")
+        
+        if total_non_zero == 0:
+            logger.error("\n WARNING: NO MASKS WITH DATA WERE CREATED!")
+            logger.error("   Check if your mask file actually contains segmentation data!")
+        
+        logger.info(f"{'='*60}")
+
+def main():
+    MRI_FOLDER = "path"
+    MASK_FILE = "path"
+    OUTPUT_FOLDER = "path"
+    
+    aligner = SpatialDICOMAligner(
+        mri_folder=MRI_FOLDER,
+        mask_file=MASK_FILE,
+        output_folder=OUTPUT_FOLDER,
+        position_tolerance=0.5,  # Try increasing to 1.0 or 2.0 if no matches
+        debug_mode=True
+    )
+    
+    aligner.align_and_save()
+
+if __name__ == "__main__":
+    main()
+
+
+### After convertion, check overlay! ###
+--- Check Converted Overlays ------
+
+import pydicom
+import matplotlib.pyplot as plt
+
+def verify_overlay(mri_path, mask_path, alpha=0.35):
+    mri_ds  = pydicom.dcmread(mri_path, force=True)
+    mask_ds = pydicom.dcmread(mask_path, force=True) 
+
+    mri_img  = mri_ds.pixel_array.astype(float)
+    mask_img = mask_ds.pixel_array.astype(float)
+
+    mri_norm = (mri_img - mri_img.min()) / (mri_img.max() - mri_img.min() + 1e-8)
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    axes[0].imshow(mri_norm, cmap='gray'); axes[0].set_title('MRI')
+    axes[1].imshow(mask_img, cmap='hot');  axes[1].set_title('Mask')
+    axes[2].imshow(mri_norm, cmap='gray')
+    axes[2].imshow(mask_img > 0, cmap='Reds', alpha=alpha)
+    axes[2].set_title('Overlay')
+
+    for ax in axes: ax.axis('off')
+    plt.tight_layout()
+    plt.savefig('overlay_check.png', dpi=150)
+    plt.show()
+
+# Then call it like this:
+verify_overlay(
+    mri_path  = "pathpathpath",
+    mask_path = "pathpath"
+)
+
+#### To examine the iamges to be converted further (like metadata)####
+import pydicom
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+def inspect_mask_file(mask_path):
+    """
+    Deep inspection of DICOM mask file to understand its structure
+    """
+    print("\n" + "="*70)
+    print("DICOM MASK DEEP INSPECTION")
+    print("="*70)
+    
+    mask_path = Path(mask_path)
+    print(f"\nFile: {mask_path.name}")
+    print(f"Size: {mask_path.stat().st_size / 1024:.2f} KB")
+    
+    try:
+        ds = pydicom.dcmread(str(mask_path), force=True)
+        print("\n--- DICOM METADATA ---")
+        print(f"Transfer Syntax: {ds.file_meta.TransferSyntaxUID if hasattr(ds, 'file_meta') else 'Unknown'}")
+        print(f"Modality: {ds.Modality if hasattr(ds, 'Modality') else 'Unknown'}")
+        print(f"Patient ID: {ds.PatientID if hasattr(ds, 'PatientID') else 'Unknown'}")
+        
+        # Get pixel array
+        pixel_array = ds.pixel_array
+        print(f"\n--- PIXEL DATA ---")
+        print(f"Shape: {pixel_array.shape}")
+        print(f"Dtype: {pixel_array.dtype}")
+        print(f"Min value: {pixel_array.min()}")
+        print(f"Max value: {pixel_array.max()}")
+        print(f"Mean value: {pixel_array.mean():.4f}")
+        print(f"Unique values: {np.unique(pixel_array)[:20]}")  # Show first 20 unique values
+        print(f"Total pixels: {pixel_array.size:,}")
+        print(f"Non-zero pixels: {np.count_nonzero(pixel_array):,}")
+        print(f"Non-zero percentage: {100 * np.count_nonzero(pixel_array) / pixel_array.size:.2f}%")
+        
+        # Check for specific DICOM attributes
+        print(f"\n--- SPATIAL INFO ---")
+        if hasattr(ds, 'ImagePositionPatient'):
+            print(f"ImagePositionPatient: {ds.ImagePositionPatient}")
+        if hasattr(ds, 'SliceLocation'):
+            print(f"SliceLocation: {ds.SliceLocation}")
+        if hasattr(ds, 'SpacingBetweenSlices'):
+            print(f"SpacingBetweenSlices: {ds.SpacingBetweenSlices}")
+        if hasattr(ds, 'SliceThickness'):
+            print(f"SliceThickness: {ds.SliceThickness}")
+        if hasattr(ds, 'PixelSpacing'):
+            print(f"PixelSpacing: {ds.PixelSpacing}")
+        
+        # Check for multi-frame
+        print(f"\n--- STRUCTURE ---")
+        if hasattr(ds, 'NumberOfFrames'):
+            print(f"Number of Frames: {ds.NumberOfFrames}")
+        if hasattr(ds, 'PerFrameFunctionalGroupsSequence'):
+            print(f"Has PerFrameFunctionalGroupsSequence: Yes ({len(ds.PerFrameFunctionalGroupsSequence)} frames)")
+        
+        # Analyze each slice if 3D
+        if len(pixel_array.shape) == 3:
+            print(f"\n--- PER-SLICE ANALYSIS ---")
+            print(f"Total slices: {pixel_array.shape[0]}")
+            non_empty_slices = []
+            for i in range(pixel_array.shape[0]):
+                slice_data = pixel_array[i]
+                non_zero = np.count_nonzero(slice_data)
+                if non_zero > 0:
+                    non_empty_slices.append(i)
+                    print(f"  Slice {i:3d}: {non_zero:6d} non-zero pixels, "
+                          f"min={slice_data.min()}, max={slice_data.max()}, "
+                          f"unique={len(np.unique(slice_data))}")
+            
+            if not non_empty_slices:
+                print("   ALL SLICES ARE EMPTY (all zeros)!")
+            else:
+                print(f"\n  ✓ Found {len(non_empty_slices)} non-empty slices: {non_empty_slices}")
+        
+        # Try to visualize middle slice
+        print(f"\n--- VISUALIZATION ---")
+        if len(pixel_array.shape) == 3:
+            mid_slice = pixel_array.shape[0] // 2
+            slice_data = pixel_array[mid_slice]
+        else:
+            slice_data = pixel_array
+        
+        plt.figure(figsize=(12, 4))
+        
+        plt.subplot(1, 3, 1)
+        plt.imshow(slice_data, cmap='gray')
+        plt.title(f'Raw Mask Data\n(min={slice_data.min()}, max={slice_data.max()})')
+        plt.colorbar()
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 2)
+        plt.imshow(slice_data > 0, cmap='gray')
+        plt.title(f'Binarized (>0)\n({np.count_nonzero(slice_data)} non-zero)')
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 3)
+        plt.hist(slice_data.flatten(), bins=50, log=True)
+        plt.title('Pixel Value Histogram (log scale)')
+        plt.xlabel('Pixel Value')
+        plt.ylabel('Count (log)')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        output_path = f'mask_inspection_{mask_path.stem}.png'
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization: {output_path}")
+        plt.show()
+        
+        # Check specific DICOM tags that might indicate the issue
+        print(f"\n--- ADDITIONAL CHECKS ---")
+        if hasattr(ds, 'RescaleIntercept'):
+            print(f"RescaleIntercept: {ds.RescaleIntercept}")
+        if hasattr(ds, 'RescaleSlope'):
+            print(f"RescaleSlope: {ds.RescaleSlope}")
+        if hasattr(ds, 'WindowCenter'):
+            print(f"WindowCenter: {ds.WindowCenter}")
+        if hasattr(ds, 'WindowWidth'):
+            print(f"WindowWidth: {ds.WindowWidth}")
+        if hasattr(ds, 'BitsAllocated'):
+            print(f"BitsAllocated: {ds.BitsAllocated}")
+        if hasattr(ds, 'BitsStored'):
+            print(f"BitsStored: {ds.BitsStored}")
+        if hasattr(ds, 'HighBit'):
+            print(f"HighBit: {ds.HighBit}")
+        
+        print("\n" + "="*70)
+        
+        # DIAGNOSIS
+        print("\n🔍 DIAGNOSIS:")
+        if np.count_nonzero(pixel_array) == 0:
+            print(" PROBLEM: Mask file contains ONLY ZEROS!")
+            print("   Possible causes:")
+            print("   1. Wrong file - this might not be a mask file")
+            print("   2. Mask was saved incorrectly")
+            print("   3. Mask data is stored in a different format")
+            print("   4. Need to check the annotation/segmentation tool output")
+        elif pixel_array.max() <= 1:
+            print("  POTENTIAL ISSUE: Mask values are 0 or 1 (binary)")
+            print("   This is actually fine, but might be hard to see")
+            print("   The aligner should multiply by 255 for visibility")
+        else:
+            print("✓ Mask appears to have data")
+        
+        print("="*70 + "\n")
+        
+        return ds, pixel_array
+        
+    except Exception as e:
+        print(f"\n ERROR reading file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+def check_alternative_mask_formats(mask_folder):
+    """
+    Check if there are PNG or other mask formats in the folder
+    """
+    mask_folder = Path(mask_folder)
+    print("\n" + "="*70)
+    print("CHECKING FOR ALTERNATIVE MASK FORMATS")
+    print("="*70)
+    
+    png_masks = list(mask_folder.glob("*.png"))
+    npy_masks = list(mask_folder.glob("*.npy"))
+    nifti_masks = list(mask_folder.glob("*.nii*"))
+    
+    print(f"\nFound in {mask_folder}:")
+    print(f"  PNG files: {len(png_masks)}")
+    print(f"  NPY files: {len(npy_masks)}")
+    print(f"  NIfTI files: {len(nifti_masks)}")
+    
+    if png_masks:
+        print(f"\n📁 PNG masks found:")
+        for png in png_masks[:5]:
+            print(f"  - {png.name}")
+    
+    if npy_masks:
+        print(f"\n📁 NPY masks found:")
+        for npy in npy_masks[:5]:
+            print(f"  - {npy.name}")
+    
+    print("="*70 + "\n")
+
+def main():
+    # Inspect the mask file
+    MASK_FILE = "path_to_file"
+    
+    print("="*70)
+    print("MASK FILE INSPECTION TOOL")
+    print("="*70)
+    print("\nThis will help diagnose why your masks are blank")
+    
+    ds, pixel_array = inspect_mask_file(MASK_FILE)
+    
+    # Check the folder for alternative formats
+    mask_folder = Path(MASK_FILE).parent
+    check_alternative_mask_formats(mask_folder)
+    
+    # Additional recommendations
+    print("\n" + "="*70)
+    print("RECOMMENDATIONS:")
+    print("="*70)
+    print("\n1. Check if the mask file extension is missing (.dcm)")
+    print("2. Verify this is actually a segmentation mask, not an image")
+    print("3. Check if masks are in a different folder (PNG, NIfTI, etc.)")
+    print("4. Verify the annotation software exported correctly")
+    print("5. Try opening the file in a DICOM viewer (e.g., 3D Slicer, ITK-SNAP)")
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
+    main()
