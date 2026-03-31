@@ -36,11 +36,11 @@ class Config:
     OUTPUT_BASE = 'T1_25D_Final_Model'
     
     # Data paths
-    TRAIN_DICOM_DIR = "CSANet/Last_Dataset_October/T1_Dicoms/ALL_T1_DICOMS_Renamed"
-    TRAIN_MASK_DIR_A = "CSANet/Last_Dataset_October/T1_Masks_NH"
-    TRAIN_MASK_DIR_B = "CSANet/Last_Dataset_October/T1_Masks_IL/T1_Masks_complete"
-    VAL_DICOM_DIR = "CSANet/Last_Dataset_October/T1_Validation_Dicoms"
-    VAL_MASK_DIR = "CSANet/Last_Dataset_October/T1_Validation_Masks"
+    TRAIN_DICOM_DIR = ""
+    TRAIN_MASK_DIR_A = ""
+    TRAIN_MASK_DIR_B = ""
+    VAL_DICOM_DIR = ""
+    VAL_MASK_DIR = ""
     
     # Training parameters
     TOTAL_EPOCHS = 500
