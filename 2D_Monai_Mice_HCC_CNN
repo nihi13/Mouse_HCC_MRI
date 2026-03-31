@@ -1,0 +1,760 @@
+"""
+CSANet Training with Pretrained Autoencoder Weights
+R50-B16 Architecture with Diameter Measurements
+Z-Score + FBS Normalization
+Enhanced with checkpointing and comprehensive results tracking
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib
+matplotlib.use('Agg')  # For HPC without display
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import numpy as np
+import torch.nn.functional as F
+import os
+import pydicom
+from PIL import Image
+from CSANet.networks import vit_seg_configs as configs
+from CSANet.networks.vit_seg_modeling import VisionTransformer as ViT_seg
+from monai.transforms import Compose, RandFlipd, RandGaussianNoised, RandGaussianSmoothd, EnsureTyped, RandHistogramShiftd, RandAdjustContrastd
+from datetime import datetime
+import json
+
+# ===============================
+# CONFIGURATION
+# ===============================
+class Config:
+    # UPDATED PATHS
+    AUTOENCODER_CHECKPOINT = 'autoencoder_T2.pth'  # Changed from autoencoder_checkpoint.pth
+    RESULTS_DIR = '2.5D_T2_withautoencoder'
+    CSANET_SAVE_PATH = os.path.join(RESULTS_DIR, 'csanet_best.pth')
+    CHECKPOINT_PATH = os.path.join(RESULTS_DIR, 'csanet_checkpoint.pth')
+
+    TRAIN_DICOM_DIR = ""
+    TRAIN_MASK_DIR_A = ""
+    TRAIN_MASK_DIR_B = ""
+    VAL_DICOM_DIR = ""
+    VAL_MASK_DIR = ""
+    
+    TOTAL_EPOCHS = 500
+    WARMUP_EPOCHS = 14
+    BASE_LR = 0.0009
+    WEIGHT_DECAY = 2.024638447776097e-06
+    BATCH_SIZE = 8
+    GRAD_CLIP_NORM = 1.7746466896934996
+    PATIENCE = 100
+    PIXEL_SPACING = 1.0  # mm per pixel
+    
+    # Checkpoint frequency
+    CHECKPOINT_EVERY = 10  # Save checkpoint every N epochs
+    VISUALIZE_EVERY = 50   # Generate visualizations every N epochs
+    
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+config = Config()
+
+# Create results directory
+os.makedirs(config.RESULTS_DIR, exist_ok=True)
+print(f"Results will be saved to: {config.RESULTS_DIR}")
+
+# ===============================
+# DATASET
+# ===============================
+class CSANet25DDataset(Dataset):
+    def __init__(self, dicom_dir, mask_dir, target_size=(256, 256), transforms=None):
+        self.dicom_dir = dicom_dir
+        self.mask_dir = mask_dir
+        self.target_size = target_size
+        self.transforms = transforms
+
+        if not os.path.exists(dicom_dir):
+            print(f"   ⚠ DICOM directory not found: {dicom_dir}")
+            self.common_stems = []
+            self.dicom_files = []
+            self.mask_files = []
+            return
+        
+        if not os.path.exists(mask_dir):
+            print(f"   ⚠ Mask directory not found: {mask_dir}")
+            self.common_stems = []
+            self.dicom_files = []
+            self.mask_files = []
+            return
+
+        dicom_files = sorted([f for f in os.listdir(dicom_dir) if f.lower().endswith(".dcm")])
+        mask_files = sorted([f for f in os.listdir(mask_dir) if f.lower().endswith((".png", ".dcm"))])
+
+        print(f"   Found {len(dicom_files)} DICOM files in {os.path.basename(dicom_dir)}")
+        print(f"   Found {len(mask_files)} mask files in {os.path.basename(mask_dir)}")
+
+        dicom_stems = {os.path.splitext(f)[0]: f for f in dicom_files}
+        mask_stems = {os.path.splitext(f)[0]: f for f in mask_files}
+
+        self.common_stems = sorted(list(dicom_stems.keys() & mask_stems.keys()))
+        self.dicom_files = [dicom_stems[s] for s in self.common_stems]
+        self.mask_files = [mask_stems[s] for s in self.common_stems]
+
+        if len(self.common_stems) == 0:
+            print(f"   ✗ No matching DICOM-mask pairs found!")
+            print(f"     Sample DICOM stems: {list(dicom_stems.keys())[:3]}")
+            print(f"     Sample mask stems: {list(mask_stems.keys())[:3]}")
+        else:
+            print(f"   ✓ Found {len(self.common_stems)} matched image-mask pairs.")
+
+    def __len__(self):
+        length = max(0, len(self.common_stems) - 2)
+        if length == 0:
+            print(f" WARNING: Dataset from {self.dicom_dir} has 0 valid samples!")
+            print(f"   Common stems found: {len(self.common_stems)}")
+        return length
+
+    def __getitem__(self, idx):
+        actual_idx = idx + 1
+        
+        img_prev = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx - 1]))
+        img_center = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx]))
+        img_next = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx + 1]))
+        mask = self._pad_or_resize(self._load_mask(self.common_stems[actual_idx]))
+        
+        data_dict = {
+            "img_prev": img_prev,
+            "img_center": img_center,
+            "img_next": img_next,
+            "mask": mask,
+        }
+        
+        if self.transforms:
+            data_dict = self.transforms(data_dict)
+        
+        return data_dict
+
+    def _load_dicom(self, stem):
+        path = os.path.join(self.dicom_dir, stem + ".dcm")
+        try:
+            dcm = pydicom.dcmread(path)
+        except:
+            dcm = pydicom.dcmread(path, force=True)
+        img = dcm.pixel_array.astype(np.float32)
+        
+        # Z-Score Normalization
+        img_mean = np.mean(img)
+        img_std = np.std(img)
+        if img_std > 0:
+            img = (img - img_mean) / img_std
+        
+        # Fixed Bin Size (FBS) with 32 bins
+        img_min = np.min(img)
+        img_max = np.max(img)
+        if img_max > img_min:
+            img_normalized = (img - img_min) / (img_max - img_min)
+        else:
+            img_normalized = np.zeros_like(img)
+        
+        # Quantize to 32 bins
+        img_binned = np.floor(img_normalized * 31) / 31.0
+        
+        return torch.from_numpy(img_binned).unsqueeze(0)
+
+    def _load_mask(self, stem):
+        for ext in [".png", ".dcm"]:
+            path = os.path.join(self.mask_dir, stem + ext)
+            if os.path.exists(path):
+                try:
+                    if ext == ".png":
+                        mask = np.array(Image.open(path).convert("L"), dtype=np.float32)
+                        mask = (mask > 127).astype(np.float32)
+                    else:
+                        try:
+                            dcm = pydicom.dcmread(path)
+                        except:
+                            dcm = pydicom.dcmread(path, force=True)
+                        mask = dcm.pixel_array.astype(np.float32)
+                        mask = (mask > 0).astype(np.float32)
+                    return torch.from_numpy(mask).unsqueeze(0)
+                except Exception as e:
+                    print(f"   Warning: Could not load mask {stem}{ext}: {e}")
+                    continue
+        
+        raise FileNotFoundError(f"Mask not found for {stem} in {self.mask_dir}")
+
+    def _pad_or_resize(self, img):
+        if img.shape[1] != self.target_size[0] or img.shape[2] != self.target_size[1]:
+            c, h, w = img.shape
+            target_h, target_w = self.target_size
+            pad_h = max(target_h - h, 0)
+            pad_w = max(target_w - w, 0)
+            pad_top, pad_bottom = pad_h // 2, pad_h - pad_h // 2
+            pad_left, pad_right = pad_w // 2, pad_w - pad_w // 2
+            img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+            if img.shape[1] > target_h or img.shape[2] > target_w:
+                start_h = (img.shape[1] - target_h) // 2
+                start_w = (img.shape[2] - target_w) // 2
+                img = img[:, start_h:start_h + target_h, start_w:start_w + target_w]
+        return img
+
+# ===============================
+# FOCAL LOSS
+# ===============================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        elif self.reduction == 'sum':
+            return F_loss.sum()
+        return F_loss
+
+# ===============================
+# DICE SCORE
+# ===============================
+def dice_score(y_true, y_pred, smooth=1e-6):
+    y_true = y_true.squeeze(1)
+    y_pred = y_pred.long()
+    intersection = (y_true * y_pred).sum(dim=(1,2))
+    dice = (2. * intersection + smooth) / (
+        y_true.sum(dim=(1,2)) + y_pred.sum(dim=(1,2)) + smooth
+    )
+    return dice.mean()
+
+# ===============================
+# LOAD AUTOENCODER WEIGHTS
+# ===============================
+def load_autoencoder_weights(model, autoencoder_path, device='cuda'):
+    """
+    Load pretrained autoencoder encoder weights into CSANet
+    WITHOUT freezing - allows continued learning
+    Handles both full autoencoder checkpoints and encoder-only checkpoints
+    """
+    if not os.path.exists(autoencoder_path):
+        print(f"⚠ Autoencoder checkpoint not found: {autoencoder_path}")
+        print("   Proceeding with random initialization...")
+        return model
+    
+    print("\n" + "="*70)
+    print("LOADING AUTOENCODER WEIGHTS INTO CSANET")
+    print("="*70)
+    print(f"\n1. Loading autoencoder from: {autoencoder_path}")
+    
+    autoencoder_state = torch.load(autoencoder_path, map_location=device)
+    
+    # Handle different checkpoint formats
+    if isinstance(autoencoder_state, dict):
+        # Check if it's a training checkpoint with nested structure
+        if 'model_state_dict' in autoencoder_state:
+            print("   Detected training checkpoint format")
+            autoencoder_state = autoencoder_state['model_state_dict']
+        # If epoch/optimizer info exists but no model_state_dict, it's the direct state
+        elif 'epoch' in autoencoder_state or 'optimizer_state_dict' in autoencoder_state:
+            # Filter out non-model keys
+            autoencoder_state = {k: v for k, v in autoencoder_state.items() 
+                               if not k in ['epoch', 'optimizer_state_dict', 'scheduler_state_dict', 
+                                          'train_losses', 'val_losses', 'best_val_loss']}
+    
+    encoder_weights = {}
+    
+    # Extract encoder weights from autoencoder checkpoint
+    for key, value in autoencoder_state.items():
+        if key.startswith('encoder.'):
+            new_key = key.replace('encoder.', '')
+            encoder_weights[new_key] = value
+        elif key.startswith('module.encoder.'):
+            new_key = key.replace('module.encoder.', '')
+            encoder_weights[new_key] = value
+    
+    print(f"   Found {len(encoder_weights)} encoder weight tensors")
+    
+    if len(encoder_weights) == 0:
+        print("   ⚠ WARNING: No encoder weights found in checkpoint!")
+        print("   Checkpoint keys sample:", list(autoencoder_state.keys())[:5])
+        print("   Proceeding with random initialization...")
+        return model
+    
+    # Get hybrid encoder from CSANet model
+    hybrid_encoder = model.transformer.embeddings.hybrid_model
+    print("\n2. Transferring weights to CSANet hybrid encoder...")
+    
+    # Load weights without strict checking to handle partial matches
+    missing_keys, unexpected_keys = hybrid_encoder.load_state_dict(encoder_weights, strict=False)
+    loaded_keys = set(encoder_weights.keys()) - set(missing_keys)
+    
+    print(f"\n   Weight Transfer Summary:")
+    print(f"   ✓ Total AE encoder weights:    {len(encoder_weights)}")
+    print(f"   ✓ Successfully matched:        {len(loaded_keys)}")
+    print(f"   ✓ Missing (not in CSANet):     {len(missing_keys)}")
+    print(f"   ✓ Unexpected (extra in AE):    {len(unexpected_keys)}")
+    
+    if len(loaded_keys) < len(encoder_weights) * 0.5:
+        print("\n   ⚠ WARNING: Less than 50% of weights were matched!")
+        print("   This might indicate architecture mismatch")
+    
+    # CRITICAL: Ensure encoder is trainable (NOT frozen)
+    print("\n3. Ensuring encoder remains trainable for continued learning...")
+    for param in hybrid_encoder.parameters():
+        param.requires_grad = True
+    
+    trainable_params = sum(p.numel() for p in hybrid_encoder.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in hybrid_encoder.parameters())
+    print(f"   ✓ Trainable parameters: {trainable_params:,} / {total_params:,}")
+    print(f"   ✓ Encoder is UNFROZEN - will continue learning during training!")
+    
+    print("\n" + "="*70)
+    print("AUTOENCODER WEIGHTS LOADED SUCCESSFULLY!")
+    print("="*70 + "\n")
+    
+    return model
+
+# ===============================
+# DIAMETER MEASUREMENT
+# ===============================
+def measure_diameter(mask, pixel_spacing=1.0):
+    """
+    Measure diameter of mask regions using contours.
+    Returns list of diameters in mm and total diameter in mm.
+    pixel_spacing: mm per pixel (default 1.0mm/pixel)
+    """
+    from scipy import ndimage
+    
+    mask_binary = (mask > 0.5).astype(np.uint8)
+    labeled, num_features = ndimage.label(mask_binary)
+    
+    diameters = []
+    for i in range(1, num_features + 1):
+        region = (labeled == i)
+        # Find bounding box
+        y_coords, x_coords = np.where(region)
+        if len(y_coords) == 0:
+            continue
+        
+        # Calculate diameter as max distance
+        height = np.max(y_coords) - np.min(y_coords) + 1
+        width = np.max(x_coords) - np.min(x_coords) + 1
+        diameter_px = np.sqrt(height**2 + width**2)
+        diameter_mm = diameter_px * pixel_spacing
+        diameters.append(diameter_mm)
+    
+    total_diameter = sum(diameters) if diameters else 0
+    return diameters, total_diameter
+
+# ===============================
+# CHECKPOINT MANAGEMENT
+# ===============================
+def save_checkpoint(epoch, model, optimizer, scheduler, train_losses, val_losses, 
+                   dice_scores, best_dice, config):
+    """Save training checkpoint"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'dice_scores': dice_scores,
+        'best_dice': best_dice,
+        'config': {
+            'BASE_LR': config.BASE_LR,
+            'WEIGHT_DECAY': config.WEIGHT_DECAY,
+            'BATCH_SIZE': config.BATCH_SIZE,
+            'GRAD_CLIP_NORM': config.GRAD_CLIP_NORM
+        }
+    }
+    torch.save(checkpoint, config.CHECKPOINT_PATH)
+    print(f"   💾 Checkpoint saved at epoch {epoch + 1}")
+
+def load_checkpoint(model, optimizer, scheduler, config, device):
+    """Load training checkpoint if it exists"""
+    if not os.path.exists(config.CHECKPOINT_PATH):
+        return 0, [], [], [], 0.0
+    
+    print(f"\n📂 Loading checkpoint from: {config.CHECKPOINT_PATH}")
+    checkpoint = torch.load(config.CHECKPOINT_PATH, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    train_losses = checkpoint['train_losses']
+    val_losses = checkpoint['val_losses']
+    dice_scores = checkpoint['dice_scores']
+    best_dice = checkpoint['best_dice']
+    
+    print(f"   ✓ Resumed from epoch {start_epoch}")
+    print(f"   ✓ Best Dice so far: {best_dice:.6f}")
+    print(f"   ✓ Training history loaded: {len(train_losses)} epochs\n")
+    
+    return start_epoch, train_losses, val_losses, dice_scores, best_dice
+
+# ===============================
+# TRAINING FUNCTION
+# ===============================
+def train_csanet(model, train_loader, val_loader, device, config):
+    print("\n" + "="*70)
+    print("TRAINING CONFIGURATION")
+    print("="*70)
+    print(f"  Device:            {device}")
+    print(f"  Loss Function:     Weighted Focal Loss")
+    print(f"  Total Epochs:      {config.TOTAL_EPOCHS}")
+    print(f"  Base LR:           {config.BASE_LR:.8f}")
+    print(f"  Batch Size:        {config.BATCH_SIZE}")
+    print(f"  Weight Decay:      {config.WEIGHT_DECAY:.2e}")
+    print(f"  Results Dir:       {config.RESULTS_DIR}")
+    print("="*70 + "\n")
+    
+    # Heavy class weights for imbalanced data (97% bg, 3% fg)
+    class_weights = torch.tensor([1.0, 100.0], device=device)
+    criterion_ce = nn.CrossEntropyLoss(weight=class_weights)
+    criterion_focal = FocalLoss(alpha=10, gamma=3)
+    optimizer = optim.Adam(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.7, patience=8, min_lr=1e-7
+    )
+    
+    # Try to load checkpoint
+    start_epoch, train_losses, val_losses, dice_scores, best_dice = load_checkpoint(
+        model, optimizer, scheduler, config, device
+    )
+    
+    best_epoch = start_epoch
+    patience_counter = 0
+    
+    print("Starting training...\n")
+    start_time = datetime.now()
+    
+    for epoch in range(start_epoch, config.TOTAL_EPOCHS):
+        model.train()
+        running_loss = 0.0
+        
+        for i, batch in enumerate(train_loader):
+            img_prev = batch["img_prev"].to(device)
+            img_center = batch["img_center"].to(device)
+            img_next = batch["img_next"].to(device)
+            masks = batch["mask"].to(device)
+
+            outputs = model(img_prev, img_center, img_next)
+            loss_ce = criterion_ce(outputs, masks.squeeze(1).long())
+            loss_focal = criterion_focal(outputs, masks.squeeze(1).long())
+            loss = 0.3 * loss_ce + 0.7 * loss_focal
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
+            optimizer.step()
+
+            running_loss += loss.item()
+            if (i + 1) % max(1, len(train_loader) // 3) == 0:
+                print(f"  Batch {i+1}/{len(train_loader)}, Loss: {loss.item():.6f}", end='\r')
+
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_dice_list = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                val_img_prev = batch["img_prev"].to(device)
+                val_img_center = batch["img_center"].to(device)
+                val_img_next = batch["img_next"].to(device)
+                val_masks = batch["mask"].to(device)
+
+                val_outputs = model(val_img_prev, val_img_center, val_img_next)
+                v_loss_ce = criterion_ce(val_outputs, val_masks.squeeze(1).long())
+                v_loss_focal = criterion_focal(val_outputs, val_masks.squeeze(1).long())
+                v_loss = 0.3 * v_loss_ce + 0.7 * v_loss_focal
+
+                val_loss += v_loss.item()
+                pred = torch.argmax(val_outputs, dim=1)
+                dice = dice_score(val_masks, pred).item()
+                val_dice_list.append(dice)
+
+        avg_val_loss = val_loss / len(val_loader)
+        avg_dice = np.mean(val_dice_list)
+        val_losses.append(avg_val_loss)
+        dice_scores.append(avg_dice)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1:3d} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f} | Dice: {avg_dice:.6f} | LR: {current_lr:.2e}")
+        
+        # Learning rate scheduling
+        scheduler.step(avg_dice)
+        
+        # Save best model
+        if avg_dice > best_dice:
+            best_dice = avg_dice
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save(model.state_dict(), config.CSANET_SAVE_PATH)
+            print(f"   ✓ Best Dice: {best_dice:.6f} - Model saved!")
+        else:
+            patience_counter += 1
+        
+        # Save checkpoint periodically
+        if (epoch + 1) % config.CHECKPOINT_EVERY == 0:
+            save_checkpoint(epoch, model, optimizer, scheduler, train_losses, 
+                          val_losses, dice_scores, best_dice, config)
+        
+        # Generate visualizations periodically
+        if (epoch + 1) % config.VISUALIZE_EVERY == 0:
+            print(f"   📊 Generating visualizations at epoch {epoch + 1}...")
+            visualize_overlays(model, val_loader, device, epoch + 1, 
+                             num_images=4, pixel_spacing=config.PIXEL_SPACING,
+                             save_dir=config.RESULTS_DIR)
+        
+        # Early stopping
+        if patience_counter >= config.PATIENCE:
+            print(f"\n⚠ No improvement for {config.PATIENCE} epochs - stopping")
+            break
+    
+    # Save final checkpoint
+    save_checkpoint(epoch, model, optimizer, scheduler, train_losses, 
+                   val_losses, dice_scores, best_dice, config)
+    
+    training_time = datetime.now() - start_time
+    
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE!")
+    print("="*70)
+    print(f"  Best Dice:         {best_dice:.6f}")
+    print(f"  Best Epoch:        {best_epoch}")
+    print(f"  Total Epochs:      {epoch + 1}")
+    print(f"  Training Time:     {training_time}")
+    print(f"  Results saved to:  {config.RESULTS_DIR}")
+    print("="*70 + "\n")
+    
+    return train_losses, val_losses, dice_scores
+
+# ===============================
+# VISUALIZATION
+# ===============================
+def visualize_overlays(model, data_loader, device, epoch, num_images=4, 
+                      pixel_spacing=1.0, save_dir=None):
+    """Visualize and save overlay predictions"""
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            val_img_prev = batch["img_prev"].to(device)
+            val_img_center = batch["img_center"].to(device)
+            val_img_next = batch["img_next"].to(device)
+            val_masks = batch["mask"]
+            
+            val_outputs = model(val_img_prev, val_img_center, val_img_next)
+            predicted_masks = torch.argmax(val_outputs, dim=1)
+
+            val_img_center = val_img_center.cpu().numpy()
+            val_masks = val_masks.cpu().numpy()
+            predicted_masks = predicted_masks.cpu().numpy()
+
+            plt.figure(figsize=(20, num_images * 5))
+            for j in range(min(num_images, val_img_center.shape[0])):
+                # Measure diameters in mm
+                gt_diameters, gt_total = measure_diameter(val_masks[j, 0], pixel_spacing=pixel_spacing)
+                pred_diameters, pred_total = measure_diameter(predicted_masks[j], pixel_spacing=pixel_spacing)
+                
+                plt.subplot(num_images, 4, j * 4 + 1)
+                plt.imshow(val_img_center[j, 0], cmap='gray')
+                plt.title(f"Original Image {j+1}", fontsize=12)
+                plt.axis('off')
+
+                plt.subplot(num_images, 4, j * 4 + 2)
+                plt.imshow(val_masks[j, 0], cmap='gray')
+                gt_text = f"GT Mask {j+1}\n"
+                for i, d in enumerate(gt_diameters, 1):
+                    gt_text += f"D{i}: {d:.2f}mm\n"
+                gt_text += f"Total: {gt_total:.2f}mm"
+                plt.title(gt_text, fontsize=10)
+                plt.axis('off')
+
+                plt.subplot(num_images, 4, j * 4 + 3)
+                plt.imshow(predicted_masks[j], cmap='gray')
+                pred_text = f"Pred Mask {j+1}\n"
+                for i, d in enumerate(pred_diameters, 1):
+                    pred_text += f"D{i}: {d:.2f}mm\n"
+                pred_text += f"Total: {pred_total:.2f}mm"
+                plt.title(pred_text, fontsize=10)
+                plt.axis('off')
+
+                plt.subplot(num_images, 4, j * 4 + 4)
+                overlay_img = np.stack([val_img_center[j, 0]] * 3, axis=-1)
+                overlay_img = (overlay_img - overlay_img.min()) / (overlay_img.max() - overlay_img.min() + 1e-8)
+                
+                red_mask = val_masks[j, 0] > 0.5
+                overlay_img[red_mask, 0] = np.minimum(overlay_img[red_mask, 0] + 0.3, 1.0)
+                
+                green_mask = predicted_masks[j] > 0.5
+                overlay_img[green_mask, 1] = np.minimum(overlay_img[green_mask, 1] + 0.3, 1.0)
+                
+                plt.imshow(overlay_img)
+                overlay_text = f"Overlay {j+1}\n(Red: GT, Green: Pred)\n"
+                overlay_text += f"GT Total: {gt_total:.2f}mm\n"
+                overlay_text += f"Pred Total: {pred_total:.2f}mm"
+                plt.title(overlay_text, fontsize=10)
+                plt.axis('off')
+            
+            plt.suptitle(f'Validation Results - Epoch {epoch}', fontsize=16, y=0.98)
+            plt.tight_layout()
+            
+            if save_dir:
+                save_path = os.path.join(save_dir, f'overlay_epoch_{epoch:04d}.png')
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                print(f"   Saved visualization to: {save_path}")
+            
+            plt.close()
+            break
+
+# ===============================
+# MAIN EXECUTION
+# ===============================
+def main():
+    print("\n" + "="*70)
+    print("CSANet Training with Pretrained Autoencoder Weights")
+    print("R50-B16 Architecture with Diameter Measurements")
+    print("="*70)
+    
+    device = config.DEVICE
+    print(f"\nDevice: {device}")
+    
+    # Save configuration
+    config_dict = {k: str(v) for k, v in config.__dict__.items() if not k.startswith('_')}
+    with open(os.path.join(config.RESULTS_DIR, 'config.json'), 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    print(f"Configuration saved to: {os.path.join(config.RESULTS_DIR, 'config.json')}")
+    
+    # Initialize model
+    print("\n" + "="*70)
+    print("INITIALIZING R50-B16 ARCHITECTURE")
+    print("="*70)
+    config_model = configs.get_r50_b16_config()
+    model = ViT_seg(config_model, img_size=(256, 256), num_classes=config_model.n_classes).to(device)
+    print("✓ Model initialized successfully\n")
+    
+    # Load autoencoder weights
+    model = load_autoencoder_weights(model, config.AUTOENCODER_CHECKPOINT, device)
+    
+    # Augmentations
+    train_transforms = Compose([
+        RandFlipd(keys=["img_prev", "img_center", "img_next", "mask"], prob=0.5, spatial_axis=1),
+        RandGaussianNoised(keys=["img_prev", "img_center", "img_next"], prob=0.5, std=0.01),
+        RandGaussianSmoothd(keys=["img_prev", "img_center", "img_next"], prob=0.3, sigma_x=(0.5, 1.0)),
+        EnsureTyped(keys=["img_prev", "img_center", "img_next", "mask"]),
+        RandHistogramShiftd(keys=["img_prev", "img_center", "img_next"], num_control_points=10, prob=0.5),
+        RandAdjustContrastd(keys=["img_prev", "img_center", "img_next"], prob=0.5, gamma=(0.5, 4.5), invert_image=False, retain_stats=False),
+    ])
+    
+    val_transforms = Compose([
+        EnsureTyped(keys=["img_prev", "img_center", "img_next", "mask"]),
+    ])
+    
+    # Load datasets
+    print("Loading datasets...")
+    print("\n[Training Dataset A]")
+    train_dataset_A = CSANet25DDataset(config.TRAIN_DICOM_DIR, config.TRAIN_MASK_DIR_A, transforms=train_transforms)
+    print("\n[Training Dataset B]")
+    train_dataset_B = CSANet25DDataset(config.TRAIN_DICOM_DIR, config.TRAIN_MASK_DIR_B, transforms=train_transforms)
+    print("\n[Validation Dataset]")
+    val_dataset = CSANet25DDataset(config.VAL_DICOM_DIR, config.VAL_MASK_DIR, transforms=val_transforms)
+    
+    # Combine datasets
+    datasets_to_combine = []
+    if len(train_dataset_A) > 0:
+        datasets_to_combine.append(train_dataset_A)
+        print(f"\n✓ Added Dataset A: {len(train_dataset_A)} samples")
+    
+    if len(train_dataset_B) > 0:
+        datasets_to_combine.append(train_dataset_B)
+        print(f"✓ Added Dataset B: {len(train_dataset_B)} samples")
+    
+    if len(val_dataset) > 0:
+        print(f"✓ Validation dataset: {len(val_dataset)} samples")
+    
+    if len(datasets_to_combine) == 0:
+        raise ValueError("\nERROR: No valid training datasets found!")
+    
+    if len(val_dataset) == 0:
+        raise ValueError("\nERROR: Validation dataset is empty!")
+    
+    train_dataset = datasets_to_combine[0] if len(datasets_to_combine) == 1 else ConcatDataset(datasets_to_combine)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4)
+    
+    print(f"\n✓ Combined training dataset: {len(train_dataset)} samples")
+    print(f"✓ Validation dataset: {len(val_dataset)} samples")
+    print(f"✓ Train batches: {len(train_loader)}")
+    print(f"✓ Val batches: {len(val_loader)}")
+    
+    # Train
+    train_losses, val_losses, dice_scores = train_csanet(model, train_loader, val_loader, device, config)
+    
+    # Plot results
+    print("\nGenerating training plots...")
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(range(1, len(train_losses) + 1), train_losses, 'b-', label='Training Loss', linewidth=2)
+    plt.plot(range(1, len(val_losses) + 1), val_losses, 'r-', label='Validation Loss', linewidth=2)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training & Validation Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(range(1, len(dice_scores) + 1), dice_scores, 'g-', label='Dice Score', linewidth=2)
+    plt.axhline(y=max(dice_scores), color='g', linestyle='--', alpha=0.7, label=f'Best: {max(dice_scores):.4f}')
+    plt.xlabel('Epochs')
+    plt.ylabel('Dice Score')
+    plt.title('Dice Score Progress')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.ylim([0, 1])
+    
+    plt.subplot(1, 3, 3)
+    plt.scatter(val_losses, dice_scores, alpha=0.6, c=range(len(dice_scores)), cmap='viridis')
+    plt.xlabel('Validation Loss')
+    plt.ylabel('Dice Score')
+    plt.title('Loss vs Dice Score')
+    plt.colorbar(label='Epoch')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(config.RESULTS_DIR, 'training_curves.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"✓ Training curves saved to: {plot_path}")
+    plt.close()
+    
+    # Save metrics
+    metrics_path = os.path.join(config.RESULTS_DIR, 'metrics')
+    os.makedirs(metrics_path, exist_ok=True)
+    np.save(os.path.join(metrics_path, "train_losses.npy"), np.array(train_losses))
+    np.save(os.path.join(metrics_path, "val_losses.npy"), np.array(val_losses))
+    np.save(os.path.join(metrics_path, "dice_scores.npy"), np.array(dice_scores))
+    print(f"✓ Metrics saved to: {metrics_path}")
+    
+    # Final visualization
+    print("\nGenerating final prediction visualizations...")
+    visualize_overlays(model, val_loader, device, epoch=len(train_losses), 
+                      num_images=6, pixel_spacing=config.PIXEL_SPACING,
+                      save_dir=config.RESULTS_DIR)
+    
+    print("\n" + "="*70)
+    print("TRAINING PIPELINE COMPLETE!")
+    print(f"All results saved to: {config.RESULTS_DIR}")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
