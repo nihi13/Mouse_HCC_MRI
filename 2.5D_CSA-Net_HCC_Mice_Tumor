@@ -1,0 +1,657 @@
+"""
+CSANet Training with Pretrained T1 Autoencoder
+Complete with overlay visualizations and organized outputs
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import numpy as np
+import torch.nn.functional as F
+import os
+import pydicom
+from PIL import Image
+from CSANet.networks import vit_seg_configs as configs
+from CSANet.networks.vit_seg_modeling import VisionTransformer as ViT_seg
+from monai.transforms import Compose, RandFlipd, RandGaussianNoised, RandGaussianSmoothd, EnsureTyped, RandHistogramShiftd, RandAdjustContrastd
+from datetime import datetime
+from scipy import ndimage
+from scipy.spatial.distance import directed_hausdorff
+from scipy import stats
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+import seaborn as sns
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+
+# ===============================
+# CONFIGURATION
+# ===============================
+class Config:
+    # Model paths
+    AUTOENCODER_CHECKPOINT = 'autoencoder_T1.pth'  # Your trained autoencoder
+    
+    # Output directory
+    OUTPUT_BASE = 'T1_25D_Final_Model'
+    
+    # Data paths
+    TRAIN_DICOM_DIR = "CSANet/Last_Dataset_October/T1_Dicoms/ALL_T1_DICOMS_Renamed"
+    TRAIN_MASK_DIR_A = "CSANet/Last_Dataset_October/T1_Masks_NH"
+    TRAIN_MASK_DIR_B = "CSANet/Last_Dataset_October/T1_Masks_IL/T1_Masks_complete"
+    VAL_DICOM_DIR = "CSANet/Last_Dataset_October/T1_Validation_Dicoms"
+    VAL_MASK_DIR = "CSANet/Last_Dataset_October/T1_Validation_Masks"
+    
+    # Training parameters
+    TOTAL_EPOCHS = 500
+    BASE_LR = 0.0009
+    WEIGHT_DECAY = 2.024638447776097e-06
+    BATCH_SIZE = 8
+    GRAD_CLIP_NORM = 1.7746466896934996
+    PATIENCE = 100
+    PIXEL_SPACING = 1.0  # mm per pixel
+    
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def __init__(self):
+        """Create all output directories"""
+        self.CHECKPOINTS_DIR = os.path.join(self.OUTPUT_BASE, 'checkpoints')
+        self.VISUALIZATIONS_DIR = os.path.join(self.OUTPUT_BASE, 'visualizations')
+        self.OVERLAYS_DIR = os.path.join(self.OUTPUT_BASE, 'overlays')
+        self.METRICS_DIR = os.path.join(self.OUTPUT_BASE, 'metrics')
+        self.PLOTS_DIR = os.path.join(self.OUTPUT_BASE, 'plots')
+        
+        for dir_path in [self.OUTPUT_BASE, self.CHECKPOINTS_DIR, 
+                        self.VISUALIZATIONS_DIR, self.OVERLAYS_DIR,
+                        self.METRICS_DIR, self.PLOTS_DIR]:
+            os.makedirs(dir_path, exist_ok=True)
+            
+        self.CSANET_SAVE_PATH = os.path.join(self.CHECKPOINTS_DIR, 'csanet_best.pth')
+
+config = Config()
+
+# ===============================
+# METRICS MODULE
+# ===============================
+class SegmentationMetrics:
+    """Comprehensive metrics for medical image segmentation"""
+    
+    @staticmethod
+    def dice_score(y_true, y_pred, smooth=1e-6):
+        intersection = (y_true * y_pred).sum()
+        dice = (2. * intersection + smooth) / (y_true.sum() + y_pred.sum() + smooth)
+        return dice
+    
+    @staticmethod
+    def iou_score(y_true, y_pred, smooth=1e-6):
+        intersection = (y_true * y_pred).sum()
+        union = y_true.sum() + y_pred.sum() - intersection
+        iou = (intersection + smooth) / (union + smooth)
+        return iou
+    
+    @staticmethod
+    def hausdorff_distance(y_true, y_pred):
+        try:
+            y_true_points = np.argwhere(y_true > 0.5)
+            y_pred_points = np.argwhere(y_pred > 0.5)
+            
+            if len(y_true_points) == 0 or len(y_pred_points) == 0:
+                return 0.0
+            
+            hd = max(directed_hausdorff(y_true_points, y_pred_points)[0],
+                    directed_hausdorff(y_pred_points, y_true_points)[0])
+            return hd
+        except:
+            return 0.0
+    
+    @staticmethod
+    def sensitivity_specificity(y_true, y_pred):
+        tp = (y_true * y_pred).sum()
+        fn = (y_true * (1 - y_pred)).sum()
+        tn = ((1 - y_true) * (1 - y_pred)).sum()
+        fp = ((1 - y_true) * y_pred).sum()
+        
+        sensitivity = tp / (tp + fn + 1e-6)
+        specificity = tn / (tn + fp + 1e-6)
+        precision = tp / (tp + fp + 1e-6)
+        
+        return sensitivity, specificity, precision
+    
+    @staticmethod
+    def compute_all_metrics(y_true, y_pred):
+        dice = SegmentationMetrics.dice_score(y_true, y_pred)
+        iou = SegmentationMetrics.iou_score(y_true, y_pred)
+        hd = SegmentationMetrics.hausdorff_distance(y_true, y_pred)
+        sens, spec, prec = SegmentationMetrics.sensitivity_specificity(y_true, y_pred)
+        
+        return {
+            'dice': float(dice),
+            'iou': float(iou),
+            'hausdorff': float(hd),
+            'sensitivity': float(sens),
+            'specificity': float(spec),
+            'precision': float(prec)
+        }
+
+# ===============================
+# OVERLAY VISUALIZATION MODULE
+# ===============================
+class OverlayVisualization:
+    """Create professional overlay visualizations"""
+    
+    @staticmethod
+    def create_overlay_comparison(images, gt_masks, pred_masks, save_path, epoch=None):
+        """Create side-by-side overlay comparison"""
+        n_samples = min(6, len(images))
+        fig, axes = plt.subplots(3, n_samples, figsize=(n_samples * 4, 12))
+        
+        if n_samples == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for i in range(n_samples):
+            img = images[i][0].cpu().numpy() if torch.is_tensor(images[i]) else images[i][0]
+            gt = gt_masks[i].cpu().numpy() if torch.is_tensor(gt_masks[i]) else gt_masks[i]
+            pred = pred_masks[i].cpu().numpy() if torch.is_tensor(pred_masks[i]) else pred_masks[i]
+            
+            # Calculate Dice
+            dice = SegmentationMetrics.dice_score(gt, pred)
+            
+            # Row 1: Original
+            axes[0, i].imshow(img, cmap='gray')
+            axes[0, i].set_title(f'Image {i+1}', fontsize=11, fontweight='bold')
+            axes[0, i].axis('off')
+            
+            # Row 2: Ground truth overlay (Red)
+            axes[1, i].imshow(img, cmap='gray')
+            masked_gt = np.ma.masked_where(gt == 0, gt)
+            axes[1, i].imshow(masked_gt, cmap='Reds', alpha=0.5)
+            axes[1, i].set_title('Ground Truth', fontsize=11)
+            axes[1, i].axis('off')
+            
+            # Row 3: Prediction overlay (Green)
+            axes[2, i].imshow(img, cmap='gray')
+            masked_pred = np.ma.masked_where(pred == 0, pred)
+            axes[2, i].imshow(masked_pred, cmap='Greens', alpha=0.5)
+            axes[2, i].set_title(f'Prediction\nDice: {dice:.3f}', fontsize=11)
+            axes[2, i].axis('off')
+        
+        title = f'Overlay Comparison - Epoch {epoch}' if epoch else 'Final Overlay Comparison'
+        plt.suptitle(title, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        
+    @staticmethod
+    def create_detailed_overlay(images, gt_masks, pred_masks, save_path):
+        """Create detailed overlay with difference map"""
+        n_samples = min(8, len(images))
+        fig = plt.figure(figsize=(24, n_samples * 3))
+        gs = fig.add_gridspec(n_samples, 4, hspace=0.3, wspace=0.2)
+        
+        for i in range(n_samples):
+            img = images[i][0].cpu().numpy() if torch.is_tensor(images[i]) else images[i][0]
+            gt = gt_masks[i].cpu().numpy() if torch.is_tensor(gt_masks[i]) else gt_masks[i]
+            pred = pred_masks[i].cpu().numpy() if torch.is_tensor(pred_masks[i]) else pred_masks[i]
+            
+            # Calculate metrics
+            metrics = SegmentationMetrics.compute_all_metrics(gt, pred)
+            
+            # Column 1: Original
+            ax1 = fig.add_subplot(gs[i, 0])
+            ax1.imshow(img, cmap='gray')
+            ax1.set_title(f'Sample {i+1}', fontsize=10, fontweight='bold')
+            ax1.axis('off')
+            
+            # Column 2: GT Overlay (Red)
+            ax2 = fig.add_subplot(gs[i, 1])
+            ax2.imshow(img, cmap='gray')
+            masked_gt = np.ma.masked_where(gt == 0, gt)
+            ax2.imshow(masked_gt, cmap='Reds', alpha=0.5)
+            ax2.set_title('Ground Truth', fontsize=10)
+            ax2.axis('off')
+            
+            # Column 3: Pred Overlay (Green)
+            ax3 = fig.add_subplot(gs[i, 2])
+            ax3.imshow(img, cmap='gray')
+            masked_pred = np.ma.masked_where(pred == 0, pred)
+            ax3.imshow(masked_pred, cmap='Greens', alpha=0.5)
+            ax3.set_title('Prediction', fontsize=10)
+            ax3.axis('off')
+            
+            # Column 4: Difference Map
+            ax4 = fig.add_subplot(gs[i, 3])
+            ax4.imshow(img, cmap='gray')
+            
+            # TP=Green, FN=Red, FP=Blue
+            diff_rgb = np.zeros((*pred.shape, 3))
+            gt_bool = gt > 0.5
+            pred_bool = pred > 0.5
+            diff_rgb[gt_bool & pred_bool] = [0, 1, 0]      # TP - Green
+            diff_rgb[gt_bool & ~pred_bool] = [1, 0, 0]     # FN - Red
+            diff_rgb[~gt_bool & pred_bool] = [0, 0.5, 1]   # FP - Blue
+            
+            mask = (gt_bool | pred_bool).astype(bool)
+            diff_rgb_masked = np.ma.masked_where(~np.stack([mask]*3, axis=-1), diff_rgb)
+            ax4.imshow(diff_rgb_masked, alpha=0.6)
+            ax4.set_title(f'Dice: {metrics["dice"]:.3f} | IoU: {metrics["iou"]:.3f}', fontsize=9)
+            ax4.axis('off')
+        
+        fig.text(0.5, 0.02,
+                '● Green = True Positive | ● Red = False Negative | ● Blue = False Positive',
+                ha='center', fontsize=12, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        plt.suptitle('Detailed Overlay Analysis', fontsize=16, fontweight='bold', y=0.995)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close()
+
+# ===============================
+# DATASET (Same as yours)
+# ===============================
+class CSANet25DDataset(Dataset):
+    def __init__(self, dicom_dir, mask_dir, target_size=(256, 256), transforms=None):
+        self.dicom_dir = dicom_dir
+        self.mask_dir = mask_dir
+        self.target_size = target_size
+        self.transforms = transforms
+
+        if not os.path.exists(dicom_dir) or not os.path.exists(mask_dir):
+            self.common_stems = []
+            self.dicom_files = []
+            self.mask_files = []
+            return
+
+        dicom_files = sorted([f for f in os.listdir(dicom_dir) if f.lower().endswith(".dcm")])
+        mask_files = sorted([f for f in os.listdir(mask_dir) if f.lower().endswith((".png", ".dcm"))])
+
+        dicom_stems = {os.path.splitext(f)[0]: f for f in dicom_files}
+        mask_stems = {os.path.splitext(f)[0]: f for f in mask_files}
+
+        self.common_stems = sorted(list(dicom_stems.keys() & mask_stems.keys()))
+        self.dicom_files = [dicom_stems[s] for s in self.common_stems]
+        self.mask_files = [mask_stems[s] for s in self.common_stems]
+
+        print(f"   Found {len(self.common_stems)} matched pairs")
+
+    def __len__(self):
+        return max(0, len(self.common_stems) - 2)
+
+    def __getitem__(self, idx):
+        actual_idx = idx + 1
+        
+        img_prev = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx - 1]))
+        img_center = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx]))
+        img_next = self._pad_or_resize(self._load_dicom(self.common_stems[actual_idx + 1]))
+        mask = self._pad_or_resize(self._load_mask(self.common_stems[actual_idx]))
+        
+        data_dict = {
+            "img_prev": img_prev,
+            "img_center": img_center,
+            "img_next": img_next,
+            "mask": mask,
+        }
+        
+        if self.transforms:
+            data_dict = self.transforms(data_dict)
+        
+        return data_dict
+
+    def _load_dicom(self, stem):
+        path = os.path.join(self.dicom_dir, stem + ".dcm")
+        try:
+            dcm = pydicom.dcmread(path)
+        except:
+            dcm = pydicom.dcmread(path, force=True)
+        img = dcm.pixel_array.astype(np.float32)
+        
+        # Z-Score + FBS Normalization
+        img_mean = np.mean(img)
+        img_std = np.std(img)
+        if img_std > 0:
+            img = (img - img_mean) / img_std
+        
+        img_min = np.min(img)
+        img_max = np.max(img)
+        if img_max > img_min:
+            img_normalized = (img - img_min) / (img_max - img_min)
+        else:
+            img_normalized = np.zeros_like(img)
+        
+        img_binned = np.floor(img_normalized * 31) / 31.0
+        return torch.from_numpy(img_binned).unsqueeze(0)
+
+    def _load_mask(self, stem):
+        for ext in [".png", ".dcm"]:
+            path = os.path.join(self.mask_dir, stem + ext)
+            if os.path.exists(path):
+                try:
+                    if ext == ".png":
+                        mask = np.array(Image.open(path).convert("L"), dtype=np.float32)
+                        mask = (mask > 127).astype(np.float32)
+                    else:
+                        dcm = pydicom.dcmread(path, force=True)
+                        mask = dcm.pixel_array.astype(np.float32)
+                        mask = (mask > 0).astype(np.float32)
+                    return torch.from_numpy(mask).unsqueeze(0)
+                except Exception as e:
+                    continue
+        raise FileNotFoundError(f"Mask not found for {stem}")
+
+    def _pad_or_resize(self, img):
+        if img.shape[1] != self.target_size[0] or img.shape[2] != self.target_size[1]:
+            c, h, w = img.shape
+            target_h, target_w = self.target_size
+            pad_h = max(target_h - h, 0)
+            pad_w = max(target_w - w, 0)
+            pad_top, pad_bottom = pad_h // 2, pad_h - pad_h // 2
+            pad_left, pad_right = pad_w // 2, pad_w - pad_w // 2
+            img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+            if img.shape[1] > target_h or img.shape[2] > target_w:
+                start_h = (img.shape[1] - target_h) // 2
+                start_w = (img.shape[2] - target_w) // 2
+                img = img[:, start_h:start_h + target_h, start_w:start_w + target_w]
+        return img
+
+# ===============================
+# FOCAL LOSS
+# ===============================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        return F_loss
+
+# ===============================
+# LOAD AUTOENCODER WEIGHTS
+# ===============================
+def load_autoencoder_weights(model, autoencoder_path, device='cuda'):
+    """Load pretrained T1 autoencoder encoder weights into CSANet"""
+    if not os.path.exists(autoencoder_path):
+        print(f"⚠ Autoencoder checkpoint not found: {autoencoder_path}")
+        return model
+    
+    print("\n" + "="*70)
+    print("LOADING T1 AUTOENCODER WEIGHTS")
+    print("="*70)
+    print(f"Loading from: {autoencoder_path}")
+    
+    autoencoder_state = torch.load(autoencoder_path, map_location=device)
+    encoder_weights = {}
+    
+    # Extract encoder weights
+    for key, value in autoencoder_state.items():
+        if key.startswith('encoder.'):
+            new_key = key.replace('encoder.', '')
+            encoder_weights[new_key] = value
+    
+    # Load into hybrid model
+    hybrid_encoder = model.transformer.embeddings.hybrid_model
+    missing_keys, unexpected_keys = hybrid_encoder.load_state_dict(encoder_weights, strict=False)
+    
+    print(f"✓ Loaded {len(encoder_weights) - len(missing_keys)} encoder weights")
+    print(f"✓ Encoder unfrozen for continued learning")
+    print("="*70 + "\n")
+    
+    return model
+
+# ===============================
+# TRAINING FUNCTION
+# ===============================
+def train_csanet(model, train_loader, val_loader, device, config):
+    print("\n" + "="*70)
+    print("TRAINING CSANet WITH T1 AUTOENCODER")
+    print("="*70)
+    
+    class_weights = torch.tensor([1.0, 100.0], device=device)
+    criterion_ce = nn.CrossEntropyLoss(weight=class_weights)
+    criterion_focal = FocalLoss(alpha=10, gamma=3)
+    optimizer = optim.Adam(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.7, patience=8)
+    
+    best_dice = 0.0
+    train_losses, val_losses, dice_scores = [], [], []
+    metrics_calculator = SegmentationMetrics()
+    patience_counter = 0
+    
+    for epoch in range(config.TOTAL_EPOCHS):
+        # Training
+        model.train()
+        running_loss = 0.0
+        
+        for batch in train_loader:
+            img_prev = batch["img_prev"].to(device)
+            img_center = batch["img_center"].to(device)
+            img_next = batch["img_next"].to(device)
+            masks = batch["mask"].to(device)
+
+            outputs = model(img_prev, img_center, img_next)
+            loss_ce = criterion_ce(outputs, masks.squeeze(1).long())
+            loss_focal = criterion_focal(outputs, masks.squeeze(1).long())
+            loss = 0.3 * loss_ce + 0.7 * loss_focal
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_dice_list = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                val_img_prev = batch["img_prev"].to(device)
+                val_img_center = batch["img_center"].to(device)
+                val_img_next = batch["img_next"].to(device)
+                val_masks = batch["mask"].to(device)
+
+                val_outputs = model(val_img_prev, val_img_center, val_img_next)
+                v_loss = 0.3 * criterion_ce(val_outputs, val_masks.squeeze(1).long()) + \
+                        0.7 * criterion_focal(val_outputs, val_masks.squeeze(1).long())
+
+                val_loss += v_loss.item()
+                pred = torch.argmax(val_outputs, dim=1)
+                
+                for i in range(val_masks.shape[0]):
+                    dice = metrics_calculator.dice_score(
+                        val_masks[i].cpu().numpy().squeeze(),
+                        pred[i].cpu().numpy()
+                    )
+                    val_dice_list.append(dice)
+
+        avg_val_loss = val_loss / len(val_loader)
+        avg_dice = np.mean(val_dice_list)
+        val_losses.append(avg_val_loss)
+        dice_scores.append(avg_dice)
+        
+        print(f"Epoch {epoch+1:3d} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f} | Dice: {avg_dice:.6f}")
+        
+        scheduler.step(avg_dice)
+        
+        # Save best model
+        if avg_dice > best_dice:
+            best_dice = avg_dice
+            patience_counter = 0
+            torch.save(model.state_dict(), config.CSANET_SAVE_PATH)
+            print(f"   ✓ Best Dice: {best_dice:.6f} - Saved!")
+            
+            # Generate overlay visualizations for best model
+            if epoch % 20 == 0:  # Every 20 epochs
+                generate_overlay_visualizations(model, val_loader, device, config, epoch)
+        else:
+            patience_counter += 1
+            if patience_counter >= config.PATIENCE:
+                print(f"\n⚠ No improvement for {config.PATIENCE} epochs - stopping")
+                break
+    
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE!")
+    print("="*70)
+    print(f"Best Dice: {best_dice:.6f}")
+    print("="*70 + "\n")
+    
+    return train_losses, val_losses, dice_scores
+
+def generate_overlay_visualizations(model, val_loader, device, config, epoch=None):
+    """Generate overlay visualizations during/after training"""
+    model.eval()
+    
+    all_images = []
+    all_gt_masks = []
+    all_pred_masks = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            img_center = batch["img_center"].to(device)
+            img_prev = batch["img_prev"].to(device)
+            img_next = batch["img_next"].to(device)
+            masks = batch["mask"].to(device)
+            
+            outputs = model(img_prev, img_center, img_next)
+            preds = torch.argmax(outputs, dim=1)
+            
+            all_images.extend([img for img in img_center])
+            all_gt_masks.extend([mask.squeeze() for mask in masks])
+            all_pred_masks.extend([pred for pred in preds])
+            
+            if len(all_images) >= 8:  # Get enough samples
+                break
+    
+    # Simple overlay
+    if epoch is not None:
+        save_path = os.path.join(config.OVERLAYS_DIR, f'overlay_epoch_{epoch:04d}.png')
+    else:
+        save_path = os.path.join(config.OVERLAYS_DIR, 'overlay_final.png')
+    
+    OverlayVisualization.create_overlay_comparison(
+        all_images[:6], all_gt_masks[:6], all_pred_masks[:6], save_path, epoch
+    )
+    
+    # Detailed overlay
+    if epoch is None:  # Only for final
+        detailed_path = os.path.join(config.OVERLAYS_DIR, 'overlay_detailed_final.png')
+        OverlayVisualization.create_detailed_overlay(
+            all_images, all_gt_masks, all_pred_masks, detailed_path
+        )
+
+# ===============================
+# MAIN EXECUTION
+# ===============================
+def main():
+    print("\n" + "="*70)
+    print("CSANet Training with T1 Autoencoder")
+    print("R50-B16 Architecture - 2.5D")
+    print("="*70)
+    
+    device = config.DEVICE
+    print(f"\nDevice: {device}")
+    print(f"Output Directory: {config.OUTPUT_BASE}")
+    
+    # Initialize model
+    print("\n" + "="*70)
+    print("INITIALIZING R50-B16 ARCHITECTURE")
+    print("="*70)
+    config_model = configs.get_r50_b16_config()
+    model = ViT_seg(config_model, img_size=(256, 256), num_classes=config_model.n_classes).to(device)
+    print("✓ Model initialized\n")
+    
+    # Load T1 autoencoder weights
+    model = load_autoencoder_weights(model, config.AUTOENCODER_CHECKPOINT, device)
+    
+    # Augmentations
+    train_transforms = Compose([
+        RandFlipd(keys=["img_prev", "img_center", "img_next", "mask"], prob=0.5, spatial_axis=1),
+        RandGaussianNoised(keys=["img_prev", "img_center", "img_next"], prob=0.5, std=0.01),
+        RandGaussianSmoothd(keys=["img_prev", "img_center", "img_next"], prob=0.3, sigma_x=(0.5, 1.0)),
+        EnsureTyped(keys=["img_prev", "img_center", "img_next", "mask"]),
+        RandHistogramShiftd(keys=["img_prev", "img_center", "img_next"], num_control_points=10, prob=0.5),
+        RandAdjustContrastd(keys=["img_prev", "img_center", "img_next"], prob=0.5, gamma=(0.5, 4.5)),
+    ])
+    
+    val_transforms = Compose([
+        EnsureTyped(keys=["img_prev", "img_center", "img_next", "mask"]),
+    ])
+    
+    # Load datasets
+    print("Loading datasets...")
+    train_dataset_A = CSANet25DDataset(config.TRAIN_DICOM_DIR, config.TRAIN_MASK_DIR_A, transforms=train_transforms)
+    train_dataset_B = CSANet25DDataset(config.TRAIN_DICOM_DIR, config.TRAIN_MASK_DIR_B, transforms=train_transforms)
+    val_dataset = CSANet25DDataset(config.VAL_DICOM_DIR, config.VAL_MASK_DIR, transforms=val_transforms)
+    
+    # Combine datasets
+    datasets_to_combine = []
+    if len(train_dataset_A) > 0:
+        datasets_to_combine.append(train_dataset_A)
+    if len(train_dataset_B) > 0:
+        datasets_to_combine.append(train_dataset_B)
+    
+    train_dataset = datasets_to_combine[0] if len(datasets_to_combine) == 1 else ConcatDataset(datasets_to_combine)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    
+    print(f"\n✓ Training: {len(train_dataset)} samples")
+    print(f"✓ Validation: {len(val_dataset)} samples")
+    
+    # Train
+    train_losses, val_losses, dice_scores = train_csanet(model, train_loader, val_loader, device, config)
+    
+    # Save training curves
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, label='Train')
+    plt.plot(val_losses, label='Val')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    plt.grid(alpha=0.3)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(dice_scores)
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Score')
+    plt.title('Dice Score Progress')
+    plt.grid(alpha=0.3)
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(np.array(val_losses) - np.array(train_losses))
+    plt.axhline(0, color='red', linestyle='--', alpha=0.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Generalization Gap')
+    plt.title('Val Loss - Train Loss')
+    plt.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(config.PLOTS_DIR, 'training_curves.png'), dpi=300)
+    plt.close()
+    
+    # Load best model and generate final visualizations
+    model.load_state_dict(torch.load(config.CSANET_SAVE_PATH))
+    generate_overlay_visualizations(model, val_loader, device, config, epoch=None)
+    
+    # Save metrics
+    np.save(os.path.join(config.METRICS_DIR, 'train_losses.npy'), train_losses)
+    np.save(os.path.join(config.METRICS_DIR, 'val_losses.npy'), val_losses)
+    np.save(os.path.join(config.METRICS_DIR, 'dice_scores.npy'), dice_scores)
+    
+    print(f"\n✓ All outputs saved to: {config.OUTPUT_BASE}")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
